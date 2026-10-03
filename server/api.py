@@ -88,6 +88,13 @@ def _result_view(entry):
         "size_bytes": entry.get("size_bytes"),
         "created_at": entry.get("created_at"),
         "meta": entry.get("meta", {}),
+        # 多末端归属信息（单输出接口写入的老式条目这些字段为 None/0/1）
+        "node_id": entry.get("node_id"),
+        "node_type": entry.get("type"),
+        "node_label": entry.get("label"),
+        "path": entry.get("path", []),
+        "output_index": entry.get("output_index", 0),
+        "output_count": entry.get("output_count", 1),
         "file_url": f"/api/results/{entry.get('result_id')}/file",
     }
 
@@ -340,13 +347,17 @@ def run_pipeline():
                         pipeline_id=pipeline_id, pipeline_name=pipeline_name)
     if res["error"]:
         return jsonify({"error": res["error"], "history_id": res["history_id"]}), 200
-    entry = cache.get_entry(res["result_id"]) or {}
+    outputs = res.get("outputs", [])
     return jsonify({
+        # 主结果 = 第一个末端，保留旧字段；多末端全在 outputs 里一一对应
         "result_id": res["result_id"],
+        "result_ids": res.get("result_ids", []),
+        "outputs": outputs,
+        "output_count": len(outputs),
         "cache_hit": res["cache_hit"],
         "history_id": res["history_id"],
         "file_url": f"/api/results/{res['result_id']}/file",
-        "meta": entry.get("meta", {}),
+        "meta": (outputs[0].get("meta", {}) if outputs else {}),
         "node_results": (res["exec_result"] or {}).get("node_results", []),
     })
 
@@ -617,8 +628,13 @@ def get_history(history_id):
 @bp.delete("/history/<history_id>")
 def delete_history(history_id):
     e = history.get(history_id)
-    if e and e.get("result_id"):
-        cache.delete_result(e["result_id"])
+    if e:
+        # 多末端运行：一条历史对应多个结果文件，全部联动删除
+        result_ids = [o.get("result_id") for o in (e.get("outputs") or []) if o.get("result_id")]
+        if not result_ids and e.get("result_id"):
+            result_ids = [e["result_id"]]
+        for rid in result_ids:
+            cache.delete_result(rid)
     history.delete(history_id)
     return jsonify({"ok": True})
 

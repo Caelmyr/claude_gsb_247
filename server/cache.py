@@ -35,6 +35,42 @@ class ResultCache:
         self.store = JsonStore(config.CACHE_JSON, {})
 
     # ------------------------------------------------------------------ 读
+    def _entry_outputs(self, entry):
+        """把一条缓存条目展开为「每个末端一个描述符」。
+
+        老式单输出条目（特征/检测等单图接口写入，无 outputs 字段）合成单元素；
+        多末端条目则按 outputs 逐项返回。
+        """
+        outs = entry.get("outputs")
+        if not outs:
+            return [{
+                "result_id": entry.get("result_id"),
+                "file": entry.get("file", ""),
+                "width": entry.get("width"),
+                "height": entry.get("height"),
+                "size_bytes": entry.get("size_bytes"),
+                "meta": entry.get("meta", {}),
+                "node_id": None, "type": None, "label": None, "path": [],
+                "index": 0,
+            }]
+        return outs
+
+    def _flatten(self):
+        """全部条目 × 每个末端 -> 扁平描述符列表（含条目级公共字段）。"""
+        flat = []
+        for entry in self.store.read().values():
+            total = len(self._entry_outputs(entry))
+            for out in self._entry_outputs(entry):
+                flat.append({
+                    **out,
+                    "key": entry.get("key"),
+                    "created_at": entry.get("created_at"),
+                    "last_access": entry.get("last_access"),
+                    "output_index": out.get("index", 0),
+                    "output_count": total,
+                })
+        return flat
+
     def get(self, key):
         entry = self.store.read().get(key)
         if not entry:
@@ -44,6 +80,18 @@ class ResultCache:
             return None
         self._touch(key)
         return entry.get("result_id")
+
+    def get_outputs(self, key):
+        """多末端命中时返回全部末端描述符；任一结果文件缺失视为未命中。"""
+        entry = self.store.read().get(key)
+        if not entry:
+            return None
+        outs = self._entry_outputs(entry)
+        for out in outs:
+            if not os.path.exists(os.path.join(config.RESULTS_DIR, out.get("file", ""))):
+                return None
+        self._touch(key)
+        return outs
 
     def _touch(self, key):
         def _upd(doc):
@@ -56,9 +104,9 @@ class ResultCache:
         self.store.update(_upd)
 
     def get_entry(self, result_id):
-        for entry in self.store.read().values():
-            if entry.get("result_id") == result_id:
-                return entry
+        for out in self._flatten():
+            if out.get("result_id") == result_id:
+                return out
         return None
 
     def result_path(self, result_id):
@@ -78,14 +126,14 @@ class ResultCache:
             return None
 
     def list_results(self):
-        """按创建时间倒序返回结果条目列表。"""
-        entries = list(self.store.read().values())
+        """按创建时间倒序返回结果描述符列表（多末端的每次运行占多项）。"""
+        entries = self._flatten()
         entries.sort(key=lambda e: e.get("created_at", ""), reverse=True)
         return entries
 
     # ------------------------------------------------------------------ 写
-    def put(self, key, image, meta=None):
-        """保存结果图并登记缓存，返回 result_id。"""
+    def _write_image_file(self, image):
+        """落盘一张结果图，返回 (result_id, file_name, size, width, height)。"""
         result_id = uuid.uuid4().hex
         file_name = result_id + ".png"
         dest = os.path.join(config.RESULTS_DIR, file_name)
@@ -95,14 +143,19 @@ class ResultCache:
         tmp = dest + ".tmp"
         rgb.save(tmp, "PNG", optimize=True)
         os.replace(tmp, dest)
+        return result_id, file_name, os.path.getsize(dest), rgb.size[0], rgb.size[1]
+
+    def put(self, key, image, meta=None):
+        """保存单张结果图并登记缓存，返回 result_id。"""
+        result_id, file_name, size, width, height = self._write_image_file(image)
 
         entry = {
             "result_id": result_id,
             "key": key,
             "file": file_name,
-            "size_bytes": os.path.getsize(dest),
-            "width": rgb.size[0],
-            "height": rgb.size[1],
+            "size_bytes": size,
+            "width": width,
+            "height": height,
             "meta": meta or {},
             "created_at": now_iso(),
             "last_access": time.time(),
@@ -117,6 +170,57 @@ class ResultCache:
         self.evict_if_needed()
         return result_id
 
+    def put_many(self, key, items):
+        """一次运行产生多个末端结果：逐项落盘，登记在同一条缓存条目下。
+
+        items: [{image, meta, node_id, type, label, path, index, ok}]
+        返回 outputs 描述符列表（含 result_id/file/尺寸）。整条目录取第一个
+        末端作为主结果（result_id/file 等字段保持单输出时代的语义）。
+        """
+        now = now_iso()
+        outputs = []
+        total_bytes = 0
+        for item in items:
+            rid, file_name, size, width, height = self._write_image_file(item["image"])
+            total_bytes += size
+            outputs.append({
+                "result_id": rid,
+                "file": file_name,
+                "width": width,
+                "height": height,
+                "size_bytes": size,
+                "meta": item.get("meta") or {},
+                "node_id": item.get("node_id"),
+                "type": item.get("type"),
+                "label": item.get("label"),
+                "path": item.get("path") or [],
+                "index": item.get("index", len(outputs)),
+                "ok": bool(item.get("ok", True)),
+            })
+
+        primary = outputs[0]
+        entry = {
+            "result_id": primary["result_id"],
+            "key": key,
+            "file": primary["file"],
+            "size_bytes": total_bytes,
+            "width": primary["width"],
+            "height": primary["height"],
+            "meta": primary["meta"],
+            "created_at": now,
+            "last_access": time.time(),
+            "outputs": outputs,
+        }
+
+        def _upd(doc):
+            doc = dict(doc)
+            doc[key] = entry
+            return doc
+
+        self.store.update(_upd)
+        self.evict_if_needed()
+        return outputs
+
     # ------------------------------------------------------------------ 淘汰
     def evict_if_needed(self):
         entries = self.store.read()
@@ -127,18 +231,19 @@ class ResultCache:
         if count <= config.CACHE_MAX_ENTRIES and total_bytes <= config.CACHE_MAX_BYTES:
             return 0
 
-        # 按最后访问时间升序，优先淘汰最久未用
+        # 按最后访问时间升序，优先淘汰最久未用；多末端条目整体淘汰
         order = sorted(entries.items(), key=lambda kv: kv[1].get("last_access", 0))
         removed = 0
         while order and (len(entries) > config.CACHE_MAX_ENTRIES
                          or total_bytes > config.CACHE_MAX_BYTES):
             key, entry = order.pop(0)
-            path = os.path.join(config.RESULTS_DIR, entry.get("file", ""))
-            try:
-                if os.path.exists(path):
-                    os.unlink(path)
-            except OSError:
-                pass
+            for out in self._entry_outputs(entry):
+                path = os.path.join(config.RESULTS_DIR, out.get("file", ""))
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except OSError:
+                    pass
             entries.pop(key, None)
             total_bytes -= entry.get("size_bytes", 0)
             removed += 1
@@ -146,22 +251,32 @@ class ResultCache:
         return removed
 
     def delete_result(self, result_id):
-        """按 result_id 删除结果（供历史删除联动）。"""
-        entry = self.get_entry(result_id)
-        if not entry:
+        """按 result_id 删除结果（供历史删除联动）。
+
+        多末端条目里任一分支被删时，整条运行（同一次分叉链的所有末端）一起删，
+        避免历史记录里其余分支变成死链。
+        """
+        entries = self.store.read()
+        target_key = None
+        for key, entry in entries.items():
+            ids = {o.get("result_id") for o in self._entry_outputs(entry)}
+            if result_id in ids:
+                target_key = key
+                break
+        if target_key is None:
             return False
-        path = os.path.join(config.RESULTS_DIR, entry.get("file", ""))
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
-            pass
+        entry = entries[target_key]
+        for out in self._entry_outputs(entry):
+            path = os.path.join(config.RESULTS_DIR, out.get("file", ""))
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
 
         def _upd(doc):
             doc = dict(doc)
-            for k, e in list(doc.items()):
-                if e.get("result_id") == result_id:
-                    doc.pop(k)
+            doc.pop(target_key, None)
             return doc
         self.store.update(_upd)
         return True

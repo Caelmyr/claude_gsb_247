@@ -67,7 +67,12 @@ window.Views.compare = (function () {
   async function loadResults(el) {
     const r = await Api.get("/api/results");
     el.querySelector("#cp-result").innerHTML = `<option value="">— 选择结果 —</option>` +
-      r.results.map((x) => `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${x.width}×${x.height}</option>`).join("");
+      r.results.map((x) => {
+        const branch = x.output_count > 1
+          ? `末端${x.output_index + 1}/${x.output_count}${x.node_label ? "·" + x.node_label : ""} · `
+          : "";
+        return `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${branch}${x.width}×${x.height}</option>`;
+      }).join("");
   }
 
   async function updateCompare(el) {

@@ -16,6 +16,15 @@ window.Views.pipeline = (function () {
 
   function newId() { return "n" + (idCounter++); }
 
+  // ------------------------------------------------------------------ 末端
+  // 末端 = 没有被任何其他节点 inputs 引用的节点（扇出链的每一支终点都是末端）。
+  // 与后端 server.pipeline.sink_ids 的判定保持一致。
+  function sinkIds() {
+    const consumed = new Set();
+    nodes.forEach((n) => (n.inputs || []).forEach((s) => consumed.add(s)));
+    return nodes.filter((n) => !consumed.has(n.id)).map((n) => n.id);
+  }
+
   // ------------------------------------------------------------------ 渲染
   function nodeLabel(type) {
     const nodesInfo = C._nodesInfo || {};
@@ -45,10 +54,13 @@ window.Views.pipeline = (function () {
   function renderNodes() {
     canvas.querySelectorAll(".node").forEach((n) => n.remove());
     nodeEls = {};
+    const sinks = new Set(sinkIds());
     nodes.forEach((n) => {
+      const isSink = sinks.has(n.id) && nodes.length > 0;
       const el = C.h(`
         <div class="node ${sel === n.id ? "selected" : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
           <div class="node-header"><span class="dot"></span>${C.esc(nodeLabel(n.type))}
+            ${isSink ? '<span class="sink-tag" title="该节点是链的一个末端，运行时会产生一个独立结果">末端</span>' : ""}
             <span style="flex:1"></span><span class="node-x" title="删除">×</span></div>
           <div class="node-body">${C.esc((C._nodesInfo[n.type] && C._nodesInfo[n.type].desc) || "")}</div>
           <div class="port in" data-id="${n.id}" data-port="in"></div>
@@ -59,6 +71,19 @@ window.Views.pipeline = (function () {
       bindNode(el, n);
     });
     redrawEdges();
+    updateSinkHint();
+  }
+
+  // 运行按钮旁实时提示「这条链有几个末端 → 会得到几个结果」，杜绝跑完才发现被丢
+  function updateSinkHint() {
+    const hint = inspectorEl.querySelector("#insp-sink-hint");
+    if (!hint) return;
+    const n = nodes.length ? sinkIds().length : 0;
+    if (n <= 1) {
+      hint.innerHTML = n === 1 ? "单末端链：运行后得到 <strong>1</strong> 个结果。" : "";
+    } else {
+      hint.innerHTML = `检测到 <strong>${n}</strong> 个末端：运行后会得到 <strong>${n}</strong> 个独立结果，可在下方逐个切换查看，历史与批处理同样逐支保存。`;
+    }
   }
 
   function redrawEdges() {
@@ -193,6 +218,7 @@ window.Views.pipeline = (function () {
         <div class="field"><label>加载已保存流水线</label>
           <div class="select-row"><select id="insp-load"></select><button class="btn btn-sm" id="insp-load-btn">加载</button></div>
         </div>
+        <div id="insp-sink-hint" class="sink-hint"></div>
         <div id="insp-preview" class="stage" style="margin-top:10px;min-height:120px"><span class="dim">运行后在此显示结果</span></div>`);
       inspectorEl.querySelector("#insp-run").onclick = runPipeline;
       inspectorEl.querySelector("#insp-save").onclick = savePipeline;
@@ -224,11 +250,9 @@ window.Views.pipeline = (function () {
     preview.innerHTML = `<div class="loading">运行中…</div>`;
     try {
       const r = await Api.post("/api/run", { image_id: imageId, nodes: nodes.map(strip), pipeline_name: "临时流水线" });
-      preview.innerHTML = `
-        <img src="${r.file_url}?t=${Date.now()}">
-        <div class="caption">${r.cache_hit ? "缓存命中" : "已计算"} · ${(r.meta && r.meta.count != null) ? "对象 " + r.meta.count : ""}</div>`;
+      renderOutputs(preview, r);
       // 标记失败节点
-      const failed = (r.node_results || []).filter((n) => !n.ok);
+      const failed = (r.node_results || []).filter((nr) => !nr.ok);
       if (failed.length) {
         C.toast("有节点执行失败：" + failed.map((f) => f.node_id).join(", "), "error");
         Object.values(nodeEls).forEach((el) => el.classList.remove("error"));
@@ -237,6 +261,49 @@ window.Views.pipeline = (function () {
     } catch (e) {
       preview.innerHTML = `<div class="empty">运行失败：${C.esc(e.message)}</div>`;
     }
+  }
+
+  // 把一次运行的全部末端结果渲染成标签页：每个末端一个页签 + 路径面包屑，
+  // 失败支显示错误面板而不是悄悄缺图。单末端时退化为单图，不带页签。
+  function renderOutputs(preview, r) {
+    const outs = r.outputs && r.outputs.length ? r.outputs
+      : [{ index: 0, node_id: null, label: "结果", path: [], ok: true,
+           file_url: r.file_url, meta: r.meta }];
+    const multi = outs.length > 1;
+    const tabs = multi ? `
+      <div class="out-tabs">
+        ${outs.map((o, i) => `
+          <button class="out-tab ${i === 0 ? "active" : ""} ${o.ok ? "" : "bad"}" data-out="${i}">
+            ${o.ok ? "" : "⚠ "}结果 ${i + 1}/${outs.length} · ${C.esc(o.label || "末端")}
+          </button>`).join("")}
+      </div>` : "";
+    const panels = outs.map((o, i) => {
+      const crumbs = (o.path || []).map((p) => C.esc(nodeLabel(p.type))).join(" → ");
+      const body = o.ok
+        ? `<img src="${o.file_url}?t=${Date.now()}">
+           <div class="caption">
+             ${multi ? `末端 <strong>#${C.esc(o.node_id || "-")}</strong>（${C.esc(o.label || "")}） · ` : ""}
+             ${C.esc(r.cache_hit ? "缓存命中" : "已计算")}
+             ${(o.meta && o.meta.count != null) ? " · 对象 " + o.meta.count : ""}
+           </div>
+           ${crumbs ? `<div class="out-crumb" title="从链首到该末端的完整路径">${crumbs}</div>` : ""}`
+        : `<div class="empty" style="color:var(--red)">
+             末端 #${C.esc(o.node_id || "-")}（${C.esc(o.label || "")}）执行失败：${C.esc(o.error || "未知错误")}
+           </div>
+           ${crumbs ? `<div class="out-crumb">${crumbs}</div>` : ""}`;
+      return `<div class="out-panel" data-panel="${i}" style="${i === 0 ? "" : "display:none"}">${body}</div>`;
+    }).join("");
+
+    preview.innerHTML = tabs + `<div class="out-panels">${panels}</div>`;
+    preview.querySelectorAll(".out-tab").forEach((tab) => {
+      tab.onclick = () => {
+        preview.querySelectorAll(".out-tab").forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+        preview.querySelectorAll(".out-panel").forEach((p) => {
+          p.style.display = (p.dataset.panel === tab.dataset.out) ? "" : "none";
+        });
+      };
+    });
   }
 
   function strip(n) { return { id: n.id, type: n.type, params: n.params, inputs: n.inputs, x: n.x, y: n.y }; }

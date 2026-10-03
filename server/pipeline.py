@@ -8,7 +8,9 @@
   数据包 = 图像 + meta（meta 携带关键点/检测框/分割区域等非图像数据，
   供检测->画框、分割->统计这类下游节点复用）。
 - 每节点执行包裹 try/except，错误记录到该节点，前端可定位失败点。
-- canonical_key() 生成与拓扑顺序无关的确定性哈希，供结果缓存使用。
+- 一条链允许扇出多个末端（sink）：所有「无下游消费者」的节点都是结果，
+  执行后全部收集进 outputs，绝不静默丢弃；单链场景 outputs 只有一项。
+- canonical_key() 生成与布局/命名无关的确定性哈希（连边拓扑也参与），供结果缓存使用。
 """
 import json
 
@@ -95,29 +97,99 @@ def topological_order(nodes):
 
 
 def canonical_key(nodes):
-    """生成与布局/命名无关的确定性流水线指纹（供缓存命中判定）。"""
+    """生成与布局/id 命名无关、但与连边拓扑一致的确定性流水线指纹。
+
+    节点按拓扑序编号，inputs 用「拓扑序号」表示，因此保存为流水线再恢复
+    （节点 id 全部重排）仍命中同一缓存；而分叉结构不同的链不会误命中。
+    """
     ordered, _ = _topo(nodes)
     by_id = {n["id"]: n for n in nodes}
+    topo_idx = {nid: i for i, nid in enumerate(ordered)}
     seq = []
     for nid in ordered:
         n = by_id[nid]
-        seq.append({"type": n["type"], "params": _merge_params(n)})
+        input_idx = [topo_idx[s] for s in (n.get("inputs") or [])]
+        seq.append({"type": n["type"], "params": _merge_params(n), "inputs": input_idx})
     return json.dumps(seq, sort_keys=True, separators=(",", ":"))
+
+
+def sink_ids(nodes):
+    """返回全部末端节点 id（无下游消费者），按拓扑序排列。
+
+    注意：必须在已通过 validate（无环、引用有效）的图上调用。
+    """
+    ordered, _ = _topo(nodes)
+    consumers = set()
+    for n in nodes:
+        for inp in (n.get("inputs") or []):
+            consumers.add(inp)
+    return [nid for nid in ordered if nid not in consumers]
+
+
+def _sink_paths(nodes, ordered, sinks):
+    """为每个末端生成「从源到末端」的路径标签。
+
+    当前所有节点都是单输入，每条末端路径唯一（沿 inputs 回溯到入度为 0
+    的根节点，再反转）。返回 {sink_id: [{id, type}, ...]}，分叉链的路径
+    天然在分叉点之前共享前缀，前端可用「分叉节点 → 末端」区分各支。
+    """
+    by_id = {n["id"]: n for n in nodes}
+    roots = {nid for nid in ordered if not (by_id[nid].get("inputs") or [])}
+    paths = {}
+    for sink in sinks:
+        chain = []
+        cur = sink
+        seen = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            chain.append({"id": cur, "type": by_id[cur]["type"]})
+            ins = by_id[cur].get("inputs") or []
+            cur = ins[0] if ins else None
+        chain.reverse()
+        # 根不唯一（多个无输入节点）时，路径仍以该支自己的根开头，保持可追溯
+        paths[sink] = chain if chain else [{"id": sink, "type": by_id[sink]["type"]}]
+    return paths
+
+
+def describe_sinks(nodes):
+    """返回全部末端的可展示信息（不含图像）：[{index, node_id, type, label, path}]。
+
+    缓存命中时节点 id 已与当时不同（保存/恢复会重排 id），用当前图重新计算
+    这部分标签；缓存里只复用结果文件与 meta。空链返回单个 source 占位。
+    """
+    ordered, _ = _topo(nodes)
+    sinks = sink_ids(nodes)
+    if not sinks:
+        return [{"index": 0, "node_id": None, "type": "source",
+                 "label": "原图", "path": []}]
+    paths = _sink_paths(nodes, ordered, sinks)
+    by_id = {n["id"]: n for n in nodes}
+    infos = []
+    for i, nid in enumerate(sinks):
+        infos.append({
+            "index": i, "node_id": nid, "type": by_id[nid]["type"],
+            "label": node_registry.get_node(by_id[nid]["type"])["label"],
+            "path": paths[nid],
+        })
+    return infos
 
 
 def execute(image, nodes, source_meta=None):
     """在给定图像上执行流水线。
 
-    返回 dict：
-      image          - 最终结果图像（主输出）
-      meta           - 主输出的 meta
-      node_results   - [{node_id, type, ok, error}] 逐节点状态
+    所有无下游消费者的节点都算「末端结果」，全部收集到 outputs：
+      outputs        - [{index, node_id, type, label, path, ok, error,
+                         image, meta}]，顺序 = 末端的拓扑序
+      output_count   - 末端总数
+      image/meta     - 主输出（第一个末端）的图像与 meta；无节点时为源图
       output_node_id - 主输出节点（无节点时为 None）
+      node_results   - [{node_id, type, ok, error}] 逐节点状态
       error          - 顶层错误（校验失败等）
     """
     errors = validate(nodes)
     if errors:
         return {"image": image, "meta": source_meta or {}, "node_results": [],
+                "outputs": [], "output_count": 0,
                 "output_node_id": None, "error": "; ".join(errors)}
 
     ordered, _ = _topo(nodes)
@@ -135,23 +207,31 @@ def execute(image, nodes, source_meta=None):
             out_img, out_meta = spec["handler"](input_packet.image, params, input_packet.meta)
             packets[nid] = Packet(out_img, out_meta)
             node_results.append({"node_id": nid, "type": node["type"], "ok": True, "error": None})
-        except Exception as exc:  # noqa: BLE001 —— 记录但继续，让前端能看到失败节点
+        except Exception as exc:  # noqa: BLE001 —— 记录但继续，让前端能看到失败节点与其他支结果
             packets[nid] = Packet(input_packet.image, input_packet.meta)
             node_results.append({"node_id": nid, "type": node["type"], "ok": False,
                                  "error": f"{type(exc).__name__}: {exc}"})
 
-    # 主输出 = 无下游消费者的节点中拓扑序最后一个；无节点则输出源图
-    consumers = set()
-    for n in nodes:
-        for inp in (n.get("inputs") or []):
-            consumers.add(inp)
-    sinks = [nid for nid in ordered if nid not in consumers]
-    output_node_id = sinks[-1] if sinks else (ordered[-1] if ordered else None)
+    result_by_id = {r["node_id"]: r for r in node_results}
+    outputs = []
+    for info in describe_sinks(nodes):
+        nid = info["node_id"]
+        if nid is None:
+            # 空链：输出源图
+            pkt = packets["__source__"]
+            outputs.append({**info, "ok": True, "error": None,
+                            "image": pkt.image, "meta": pkt.meta})
+            continue
+        nr = result_by_id[nid]
+        pkt = packets[nid]
+        outputs.append({**info, "ok": nr["ok"], "error": nr["error"],
+                        "image": pkt.image if nr["ok"] else None,
+                        "meta": pkt.meta if nr["ok"] else {}})
 
-    if output_node_id:
-        out = packets[output_node_id]
-    else:
-        out = packets["__source__"]
-
-    return {"image": out.image, "meta": out.meta, "node_results": node_results,
-            "output_node_id": output_node_id, "error": None}
+    primary = outputs[0]
+    return {
+        "image": primary["image"], "meta": primary["meta"],
+        "node_results": node_results, "outputs": outputs,
+        "output_count": len(outputs),
+        "output_node_id": primary["node_id"], "error": None,
+    }

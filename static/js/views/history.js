@@ -35,7 +35,7 @@ window.Views.history = (function () {
         <td class="mono">${C.fmtDate(e.created_at)}</td>
         <td title="${C.esc(e.image_name)}">${C.esc((e.image_name || "").slice(0, 18))}</td>
         <td>${C.esc(e.pipeline_name || "临时")}</td>
-        <td>${e.node_count}</td>
+        <td>${e.node_count}${e.output_count > 1 ? ` <span class="badge amber" title="该链有多个末端，结果共 ${e.output_count} 张">${e.output_count} 末端</span>` : ""}</td>
         <td>${C.fmtMs(e.duration_ms)}</td>
         <td><span class="badge ${e.status === "ok" ? "green" : "red"}">${e.status === "ok" ? "成功" : "失败"}</span>${e.cache_hit ? ' <span class="badge">缓存</span>' : ""}</td>
         <td><button class="btn btn-sm" data-id="${e.id}">查看</button></td>
@@ -56,32 +56,74 @@ window.Views.history = (function () {
     const box = el.querySelector("#hi-detail");
     const nodes = (e.pipeline_snapshot && e.pipeline_snapshot.nodes) || [];
     const nodeResults = e.node_results || [];
+    // 新记录：outputs 逐末端；旧记录只有单个 result_id，合成单元素保持可看
+    const outs = (e.outputs && e.outputs.length)
+      ? e.outputs
+      : (e.result_id ? [{ index: 0, label: "结果", path: [], ok: true, result_id: e.result_id }] : []);
+    const multi = outs.length > 1;
     box.innerHTML = `
       <div class="keypoint-stats" style="line-height:1.9">
         <div><span class="dim">状态</span> <span class="badge ${e.status === "ok" ? "green" : "red"}">${e.status === "ok" ? "成功" : "失败"}</span></div>
         <div><span class="dim">图像</span> ${C.esc(e.image_name || "-")}</div>
         <div><span class="dim">流水线</span> ${C.esc(e.pipeline_name || "临时")}（${e.node_count} 节点）</div>
+        <div><span class="dim">末端结果</span> <strong>${outs.length}</strong> 个${e.ok_output_count != null ? `（成功 ${e.ok_output_count}）` : ""}</div>
         <div><span class="dim">耗时</span> ${C.fmtMs(e.duration_ms)} · <span class="dim">缓存</span> ${e.cache_hit ? "命中" : "计算"}</div>
         ${e.error ? `<div><span class="dim">错误</span> ${C.esc(e.error)}</div>` : ""}
         <div><span class="dim">版本快照</span> ${nodes.map((n) => `<span class="badge">${C.esc(n.type)}</span>`).join(" ") || "无节点"}</div>
         ${nodeResults.length ? `<div><span class="dim">节点执行</span> ${nodeResults.map((n) => `${n.ok ? "✓" : "✗"}${n.node_id}`).join(" ")}</div>` : ""}
       </div>
-      ${e.result_id ? `<img src="/api/results/${e.result_id}/file" style="width:100%;border-radius:8px;margin-top:10px">` : ""}
+      ${outs.length ? outputsHTML(outs, multi) : '<div class="empty" style="margin-top:10px">该次运行没有可显示的结果</div>'}
       <div class="toolbar" style="margin-top:12px">
         <button class="btn" id="hi-restore">恢复为流水线</button>
         <button class="btn btn-danger" id="hi-del">删除记录</button>
       </div>`;
+    bindOutputTabs(box);
     box.querySelector("#hi-restore").onclick = async () => {
       const p = await Api.post(`/api/history/${e.id}/restore`);
       C.toast("已恢复为流水线：" + p.name, "success");
       await C.refreshPipelines();
     };
     box.querySelector("#hi-del").onclick = async () => {
-      if (!confirm("删除该历史记录（连同结果文件）？")) return;
+      if (!confirm("删除该历史记录（连同全部末端结果文件）？")) return;
       await Api.del(`/api/history/${e.id}`);
       current = null;
       C.toast("已删除", "success");
       load(document.querySelector('.view[data-view="history"]'));
     };
+  }
+
+  // 与滤镜链页同款的末端标签页：每支独立展示并给出路径面包屑
+  function outputsHTML(outs, multi) {
+    const tabs = multi ? `
+      <div class="out-tabs" style="margin-top:10px">
+        ${outs.map((o, i) => `
+          <button class="out-tab ${i === 0 ? "active" : ""} ${o.ok ? "" : "bad"}" data-out="${i}">
+            ${o.ok ? "" : "⚠ "}结果 ${i + 1}/${outs.length} · ${C.esc(o.label || "末端")}
+          </button>`).join("")}
+      </div>` : "";
+    const panels = outs.map((o, i) => {
+      const crumbs = (o.path || []).map((p) => `<span class="badge">${C.esc(p.type)}</span>`).join(" → ");
+      const body = o.ok
+        ? `<img src="/api/results/${o.result_id}/file" style="width:100%;border-radius:8px">
+           <div class="caption" style="margin-top:6px">末端 <strong>#${C.esc(o.node_id || "-")}</strong>（${C.esc(o.label || "")}）${o.width ? ` · ${o.width}×${o.height}` : ""}</div>`
+        : `<div class="empty" style="color:var(--red)">末端 #${C.esc(o.node_id || "-")}（${C.esc(o.label || "")}）执行失败：${C.esc(o.error || "未知错误")}</div>`;
+      return `<div class="out-panel" data-panel="${i}" style="${i === 0 ? "" : "display:none"};margin-top:8px">
+        ${body}
+        ${crumbs ? `<div class="out-crumb" style="margin-top:6px">${crumbs}</div>` : ""}
+      </div>`;
+    }).join("");
+    return tabs + `<div class="out-panels">${panels}</div>`;
+  }
+
+  function bindOutputTabs(box) {
+    box.querySelectorAll(".out-tab").forEach((tab) => {
+      tab.onclick = () => {
+        box.querySelectorAll(".out-tab").forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+        box.querySelectorAll(".out-panel").forEach((p) => {
+          p.style.display = (p.dataset.panel === tab.dataset.out) ? "" : "none";
+        });
+      };
+    });
   }
 })();

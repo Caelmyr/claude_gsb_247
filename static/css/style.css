@@ -229,3 +229,36 @@ input[type="color"] { width: 100%; height: 34px; border: 1px solid var(--border-
 
 .keypoint-stats { font-size: 12px; color: var(--text-dim); }
 .desc-preview { font-family: var(--mono); font-size: 11px; color: var(--text-faint); word-break: break-all; max-height: 90px; overflow: auto; background: var(--bg-soft); padding: 8px; border-radius: var(--radius-sm); }
+
+/* ---------- 多末端（分叉链）结果 ---------- */
+.sink-tag {
+  font-size: 10px; font-weight: 600; color: #fff; background: var(--amber, #f5b544);
+  border-radius: 4px; padding: 0 5px; margin-left: 4px; line-height: 16px;
+}
+.sink-hint {
+  margin-top: 8px; font-size: 12px; color: var(--text-dim);
+  background: var(--bg-soft); border: 1px dashed var(--border); border-radius: 6px;
+  padding: 6px 9px; line-height: 1.6;
+}
+.sink-hint:empty { display: none; }
+.out-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.out-tab {
+  font-size: 12px; padding: 4px 10px; border-radius: 16px; cursor: pointer;
+  background: var(--bg-soft); border: 1px solid var(--border); color: var(--text-dim);
+}
+.out-tab.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.out-tab.bad { color: var(--red); border-color: rgba(242,95,92,.4); }
+.out-crumb {
+  font-size: 11px; color: var(--text-faint); text-align: center; margin-top: 6px;
+  word-break: break-all;
+}
+.branch-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.branch-cell {
+  flex: 1 1 150px; max-width: 220px; border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px; background: var(--bg-soft);
+}
+.branch-cell.bad { border-color: rgba(242,95,92,.4); }
+.branch-cell img { width: 100%; border-radius: 5px; display: block; }
+.branch-cap { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+.job-row { border-top: 1px solid var(--border); padding: 8px 0; }
+.job-row-head { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; }

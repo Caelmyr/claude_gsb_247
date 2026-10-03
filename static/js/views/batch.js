@@ -87,22 +87,41 @@ window.Views.batch = (function () {
       const running = j.status === "queued" || j.status === "running";
       const badge = { done: "green", partial: "amber", cancelled: "amber", running: "", queued: "" }[j.status] || "red";
       const errCount = Object.values(j.results || {}).filter((r) => r.status === "error").length;
+      // 多末端流水线：统计本次任务实际产出的结果分支总数，防止「白跑不知道」
+      const branchTotal = Object.values(j.results || {}).reduce((s, r) => s + (r.output_count || (r.result_id ? 1 : 0)), 0);
       return `<div class="panel" style="margin-bottom:10px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
           <span class="badge ${badge}">${statusText(j.status)}</span>
           <span style="font-weight:600">${C.esc(j.pipeline_name || "流水线")}</span>
           <span class="dim">${j.done}/${j.total}${errCount ? ` · ${errCount} 失败` : ""}</span>
+          ${branchTotal ? `<span class="badge" title="本次任务每张图的每个末端各产生一个结果">共 ${branchTotal} 个末端结果</span>` : ""}
           <span style="flex:1"></span>
+          ${j.done ? `<button class="btn btn-sm" data-toggle="${j.id}">明细</button>` : ""}
           ${running ? `<button class="btn btn-sm btn-danger" data-cancel="${j.id}">取消</button>` : ""}
         </div>
         <div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>
         <div class="keypoint-stats" style="margin-top:6px">${C.fmtDate(j.created_at)}</div>
+        <div class="job-detail" data-detail="${j.id}" style="display:none;margin-top:10px"></div>
       </div>`;
     }).join("");
     box.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = async () => {
       await Api.post(`/api/batch/${b.dataset.cancel}/cancel`);
       C.toast("已请求取消", "success");
       loadJobs(el);
+    });
+    box.querySelectorAll("[data-toggle]").forEach((b) => {
+      b.onclick = () => {
+        const detail = box.querySelector(`[data-detail="${b.dataset.toggle}"]`);
+        if (!detail) return;
+        if (detail.style.display === "none") {
+          detail.style.display = "";
+          b.textContent = "收起";
+          renderJobDetail(detail, jobs.find((x) => x.id === b.dataset.toggle));
+        } else {
+          detail.style.display = "none";
+          b.textContent = "明细";
+        }
+      };
     });
 
     const anyRunning = jobs.some((j) => j.status === "queued" || j.status === "running");
@@ -113,5 +132,35 @@ window.Views.batch = (function () {
 
   function statusText(s) {
     return { queued: "排队中", running: "处理中", done: "完成", partial: "部分失败", cancelled: "已取消", error: "错误" }[s] || s;
+  }
+
+  // 逐张图展开：同一张图的多个末端结果横向并列，标注末端节点与支路径
+  function renderJobDetail(box, job) {
+    const rows = Object.entries(job.results || {}).map(([imageId, r]) => {
+      const outs = r.outputs && r.outputs.length
+        ? r.outputs
+        : (r.result_id ? [{ index: 0, label: "结果", path: [], ok: true, result_id: r.result_id }] : []);
+      const cells = outs.length ? outs.map((o) => {
+        const crumbs = (o.path || []).map((p) => C.esc(p.type)).join(" → ");
+        return `<div class="branch-cell ${o.ok ? "" : "bad"}" title="${crumbs}">
+          ${o.ok
+            ? `<img src="/api/results/${o.result_id}/file" loading="lazy">
+               <div class="branch-cap">结果 ${o.index + 1} · ${C.esc(o.label || "")} <span class="dim">#${C.esc(o.node_id || "-")}</span></div>`
+            : `<div class="empty" style="min-height:80px;color:var(--red)">⚠ ${C.esc(o.error || "失败")}</div>
+               <div class="branch-cap">结果 ${o.index + 1} · ${C.esc(o.label || "")}</div>`}
+        </div>`;
+      }).join("") : '<span class="dim">无结果</span>';
+      const name = (job.image_names && job.image_names[imageId]) || imageId.slice(0, 10);
+      return `<div class="job-row">
+        <div class="job-row-head">
+          <span class="badge ${r.status === "ok" ? "green" : "red"}">${r.status === "ok" ? "成功" : "失败"}</span>
+          <strong title="${C.esc(imageId)}">${C.esc(name)}</strong>
+          <span class="dim">${outs.length} 个末端${r.cache_hit ? " · 缓存命中" : ""}</span>
+        </div>
+        ${r.error ? `<div class="dim" style="color:var(--red)">${C.esc(r.error)}</div>` : ""}
+        <div class="branch-grid">${cells}</div>
+      </div>`;
+    }).join("");
+    box.innerHTML = rows || '<div class="empty">暂无已完成的图像</div>';
   }
 })();

@@ -32,46 +32,103 @@ def load_working_image(image_store, image_id):
     return img, util.downscale_to_max(img, config.MAX_DIM), rec
 
 
+def _public_output(out):
+    """去掉 PIL 图像的单末端描述（历史/JSON 落盘用）。"""
+    return {k: v for k, v in out.items() if k != "image"}
+
+
 def process_image(image_store, cache, history, image_id, nodes,
                   pipeline_id=None, pipeline_name=None):
     """对单张图执行流水线（带缓存），并记录历史。
 
-    返回 {result_id, cache_hit, error, exec_result, history_id}。
+    一条链可能有多个末端：缓存按「整次运行」存一条目、内含每个末端各自的
+    结果文件；历史与返回值用 outputs 逐末端给出 result_id/节点/路径，
+    任何末端失败都不写缓存、不落结果文件，但 outputs 里保留失败占位，
+    保证没有任何一支被静默丢弃。
+
+    返回 {result_id, result_ids, outputs, cache_hit, error, exec_result, history_id}。
     """
     t0 = time.time()
     try:
         _, work, rec = load_working_image(image_store, image_id)
     except Exception as exc:  # noqa: BLE001
-        return {"result_id": None, "cache_hit": False,
-                "error": f"载入图像失败: {exc}", "exec_result": None, "history_id": None}
+        return {"result_id": None, "result_ids": [], "outputs": [],
+                "cache_hit": False, "error": f"载入图像失败: {exc}",
+                "exec_result": None, "history_id": None}
 
     key = make_key(rec["hash"], pipeline_engine.canonical_key(nodes))
-    cached = cache.get(key)
-    if cached:
+    sink_infos = pipeline_engine.describe_sinks(nodes)
+    cached = cache.get_outputs(key)
+    if cached and len(cached) == len(sink_infos):
+        # 用当前图的节点/路径标签替换缓存标签（保存恢复后 id 已变）
+        outputs = []
+        for info, co in zip(sink_infos, cached):
+            outputs.append({**info, "ok": True, "error": None,
+                            "result_id": co["result_id"],
+                            "file_url": f"/api/results/{co['result_id']}/file",
+                            "width": co.get("width"), "height": co.get("height"),
+                            "meta": co.get("meta", {})})
         entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                                pipeline_name, cached, True, None, None, t0)
-        return {"result_id": cached, "cache_hit": True, "error": None,
+                                pipeline_name, outputs, True, None, None, t0)
+        return {"result_id": outputs[0]["result_id"],
+                "result_ids": [o["result_id"] for o in outputs],
+                "outputs": outputs, "cache_hit": True, "error": None,
                 "exec_result": None, "history_id": entry["id"]}
 
     exec_result = pipeline_engine.execute(work, nodes)
     if exec_result.get("error"):
+        outputs = []
         entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                                pipeline_name, None, False, exec_result["error"],
+                                pipeline_name, outputs, False, exec_result["error"],
                                 exec_result.get("node_results"), t0)
-        return {"result_id": None, "cache_hit": False, "error": exec_result["error"],
+        return {"result_id": None, "result_ids": [], "outputs": outputs,
+                "cache_hit": False, "error": exec_result["error"],
                 "exec_result": exec_result, "history_id": entry["id"]}
 
-    result_id = cache.put(key, exec_result["image"], exec_result["meta"])
+    exec_outputs = exec_result["outputs"]
+    failed_outs = [o for o in exec_outputs if not o["ok"]]
+    if failed_outs:
+        # 有末端执行失败：本次不缓存，成功支仍可展示；失败支在 outputs 里显式占位
+        outputs = []
+        for o in exec_outputs:
+            base = _public_output(o)
+            if o["ok"]:
+                rid = cache.put(make_key(key, "partial", o["index"], uuid.uuid4().hex),
+                                o["image"], o["meta"])
+                base["result_id"] = rid
+                base["file_url"] = f"/api/results/{rid}/file"
+            else:
+                base["result_id"] = None
+                base["file_url"] = None
+            outputs.append(base)
+        entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
+                                pipeline_name, outputs, False, None,
+                                exec_result.get("node_results"), t0)
+        return {"result_id": next((o["result_id"] for o in outputs if o["ok"]), None),
+                "result_ids": [o["result_id"] for o in outputs if o["ok"]],
+                "outputs": outputs, "cache_hit": False, "error": None,
+                "exec_result": exec_result, "history_id": entry["id"]}
+
+    stored = cache.put_many(key, exec_outputs)
+    outputs = []
+    for o, co in zip(exec_outputs, stored):
+        outputs.append({**_public_output(o), "result_id": co["result_id"],
+                        "file_url": f"/api/results/{co['result_id']}/file",
+                        "width": co["width"], "height": co["height"],
+                        "meta": co.get("meta", {})})
     entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                            pipeline_name, result_id, False, None,
+                            pipeline_name, outputs, False, None,
                             exec_result.get("node_results"), t0)
-    return {"result_id": result_id, "cache_hit": False, "error": None,
+    return {"result_id": outputs[0]["result_id"],
+            "result_ids": [o["result_id"] for o in outputs],
+            "outputs": outputs, "cache_hit": False, "error": None,
             "exec_result": exec_result, "history_id": entry["id"]}
 
 
 def _record_history(history, image_store, image_id, nodes, pipeline_id, pipeline_name,
-                    result_id, cache_hit, error, node_results, t0):
+                    outputs, cache_hit, error, node_results, t0):
     rec = image_store.get(image_id)
+    ok_outputs = [o for o in outputs if o.get("ok")]
     return history.add({
         "image_id": image_id,
         "image_name": rec.get("filename", "") if rec else "",
@@ -79,7 +136,12 @@ def _record_history(history, image_store, image_id, nodes, pipeline_id, pipeline
         "pipeline_name": pipeline_name,
         "pipeline_snapshot": {"nodes": nodes},
         "node_count": len(nodes),
-        "result_id": result_id,
+        # outputs：每个末端一项（节点/路径/result_id/ok/error），与结果一一对应
+        "outputs": outputs,
+        "output_count": len(outputs),
+        "ok_output_count": len(ok_outputs),
+        # 主结果指针 = 第一个成功末端，兼容旧页面与旧字段语义
+        "result_id": ok_outputs[0]["result_id"] if ok_outputs else None,
         "cache_hit": cache_hit,
         "status": "error" if error else "ok",
         "error": error,
@@ -115,12 +177,17 @@ class BatchManager:
         return self.queue.update(_upd)
 
     def enqueue(self, nodes, image_ids, pipeline_id=None, pipeline_name=None):
+        image_names = {}
+        for iid in image_ids:
+            rec = self.images.get(iid)
+            image_names[iid] = rec.get("filename", "") if rec else ""
         job = {
             "id": uuid.uuid4().hex,
             "pipeline_id": pipeline_id,
             "pipeline_name": pipeline_name,
             "pipeline_snapshot": {"nodes": nodes},
             "image_ids": list(image_ids),
+            "image_names": image_names,
             "total": len(image_ids),
             "done": 0,
             "status": "queued",
@@ -155,7 +222,12 @@ class BatchManager:
 
             def _done(j):
                 j["results"][image_id] = {
-                    "result_id": res["result_id"], "cache_hit": res["cache_hit"],
+                    "result_id": res["result_id"],
+                    "result_ids": res.get("result_ids", []),
+                    # 每个末端一项，批量结果页可逐图逐末端展开核对
+                    "outputs": res.get("outputs", []),
+                    "output_count": len(res.get("outputs", [])),
+                    "cache_hit": res["cache_hit"],
                     "status": "error" if res["error"] else "ok", "error": res["error"],
                 }
                 j["done"] = len(j["results"])
