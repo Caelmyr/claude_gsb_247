@@ -340,14 +340,37 @@ def run_pipeline():
                         pipeline_id=pipeline_id, pipeline_name=pipeline_name)
     if res["error"]:
         return jsonify({"error": res["error"], "history_id": res["history_id"]}), 200
+
+    def _output_view(o):
+        rid = o.get("result_id")
+        return {
+            "node_id": o.get("node_id"),
+            "type": o.get("type"),
+            "label": o.get("label") or o.get("type") or o.get("node_id"),
+            "result_id": rid,
+            "meta": o.get("meta", {}),
+            "ok": o.get("ok", True),
+            "error": o.get("error"),
+            "cache_hit": o.get("cache_hit", False),
+            "file_url": f"/api/results/{rid}/file" if rid else None,
+        }
+
+    outputs = [_output_view(o) for o in res.get("outputs", [])]
+    primary = outputs[0] if outputs else {}
     entry = cache.get_entry(res["result_id"]) or {}
     return jsonify({
+        # 向后兼容：顶层仍是主输出（拓扑序第一个末端）
         "result_id": res["result_id"],
         "cache_hit": res["cache_hit"],
         "history_id": res["history_id"],
-        "file_url": f"/api/results/{res['result_id']}/file",
+        "file_url": primary.get("file_url"),
         "meta": entry.get("meta", {}),
         "node_results": (res["exec_result"] or {}).get("node_results", []),
+        # 多末端：分叉链的每一路结果都在这里，一个都不丢
+        "outputs": outputs,
+        "output_count": len(outputs),
+        "output_node_id": ((res["exec_result"] or {}).get("output_node_id")
+                           or (outputs[0].get("node_id") if outputs else None)),
     })
 
 
@@ -617,8 +640,13 @@ def get_history(history_id):
 @bp.delete("/history/<history_id>")
 def delete_history(history_id):
     e = history.get(history_id)
-    if e and e.get("result_id"):
-        cache.delete_result(e["result_id"])
+    if e:
+        # 多末端历史可能挂着多个结果文件，全部联动删除（旧记录只有 result_id 也兼容）
+        rids = [o.get("result_id") for o in (e.get("outputs") or []) if o.get("result_id")]
+        if not rids and e.get("result_id"):
+            rids = [e["result_id"]]
+        for rid in set(rids):
+            cache.delete_result(rid)
     history.delete(history_id)
     return jsonify({"ok": True})
 

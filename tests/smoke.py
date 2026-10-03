@@ -90,6 +90,29 @@ def main():
     print(f"  执行结果: error={result['error']}  输出节点={result['output_node_id']}  节点状态={[r['ok'] for r in result['node_results']]}")
     print(f"  规范化键: {pipeline_engine.canonical_key(nodes)[:40]}...")
 
+    print("\n== 多末端（分叉）：每个 sink 都是一路独立结果，一个都不能丢 ==")
+    fork = [
+        {"id": "f1", "type": "brightness", "params": {"amount": 25}, "inputs": []},
+        {"id": "f2", "type": "blur", "params": {"radius": 3}, "inputs": ["f1"]},
+        {"id": "f3", "type": "sharpen", "params": {"amount": 60}, "inputs": ["f1"]},
+        {"id": "f4", "type": "invert", "params": {}, "inputs": ["f3"]},
+    ]
+    sinks = pipeline_engine.sink_nodes(fork)
+    assert sinks == ["f2", "f4"], sinks
+    fresult = pipeline_engine.execute(work, fork)
+    assert [o["node_id"] for o in fresult["outputs"]] == ["f2", "f4"]
+    assert fresult["output_node_id"] == "f2"  # 主输出 = 拓扑序第一个末端
+    fres = process_image(image_store, cache, history, ids["shapes.png"], fork, pipeline_name="分叉冒烟")
+    assert fres["error"] is None
+    assert len(fres["outputs"]) == 2, "分叉的两个末端都应产出结果"
+    sink_ids_seen = {o["node_id"] for o in fres["outputs"]}
+    assert sink_ids_seen == {"f2", "f4"}, sink_ids_seen
+    assert all(o["result_id"] for o in fres["outputs"]), "每路末端都要有独立 result_id"
+    fentry = history.get(fres["history_id"])
+    assert len(fentry["outputs"]) == 2, "历史记录必须保存全部末端"
+    print(f"  末端节点: {sinks} -> 每路各一个 result_id: "
+          f"{[(o['node_id'], o['result_id'][:8]) for o in fres['outputs']]}")
+
     print("\n== process_image（含缓存/历史）==")
     res1 = process_image(image_store, cache, history, ids["shapes.png"], nodes, pipeline_name="冒烟")
     res2 = process_image(image_store, cache, history, ids["shapes.png"], nodes, pipeline_name="冒烟")
@@ -129,6 +152,21 @@ def main():
     print(f"  任务状态: {j['status']}  完成 {j['done']}/{j['total']}")
     for iid, r in j["results"].items():
         print(f"    {iid[:12]}.. -> {r['status']} cache_hit={r['cache_hit']}")
+
+    print("\n== 批处理分叉链：每张图都应带全两路末端结果 ==")
+    fjob = batch.enqueue(fork, [ids["gradient.png"], ids["texture.png"]], pipeline_name="批量分叉冒烟")
+    for _ in range(60):
+        time.sleep(0.1)
+        fj = batch.get_job(fjob["id"])
+        if fj["status"] in ("done", "partial", "cancelled"):
+            break
+    fj = batch.get_job(fjob["id"])
+    print(f"  任务状态: {fj['status']}  完成 {fj['done']}/{fj['total']}")
+    for iid, r in fj["results"].items():
+        out_ids = {o["node_id"] for o in r.get("outputs", [])}
+        assert out_ids == {"f2", "f4"}, (iid, out_ids)
+        print(f"    {iid[:12]}.. -> {r['status']} 末端 {sorted(out_ids)} "
+              f"结果 {[o['result_id'][:8] for o in r['outputs']]}")
 
     print("\n== 一致性检查 ==")
     issues = image_store.reconcile()

@@ -32,45 +32,113 @@ def load_working_image(image_store, image_id):
     return img, util.downscale_to_max(img, config.MAX_DIM), rec
 
 
+def _outputs_cache_keys(nodes, base_key):
+    """为每个末端生成独立缓存键（base_key 内再按 sink node_id 区分）。"""
+    sinks = pipeline_engine.sink_nodes(nodes)
+    return {nid: make_key(base_key, "sink", nid) for nid in sinks}
+
+
 def process_image(image_store, cache, history, image_id, nodes,
                   pipeline_id=None, pipeline_name=None):
     """对单张图执行流水线（带缓存），并记录历史。
 
-    返回 {result_id, cache_hit, error, exec_result, history_id}。
+    一条链可能有多个末端（分叉），每个末端都是一路独立结果：各自走缓存、
+    各自落盘、各自出现在历史/批量结果里。返回里保留 result_id（主输出，
+    拓扑序第一个末端）做向后兼容，outputs 携带全部末端。
+
+    返回 {result_id, cache_hit, outputs, error, exec_result, history_id}。
     """
     t0 = time.time()
     try:
         _, work, rec = load_working_image(image_store, image_id)
     except Exception as exc:  # noqa: BLE001
-        return {"result_id": None, "cache_hit": False,
+        return {"result_id": None, "cache_hit": False, "outputs": [],
                 "error": f"载入图像失败: {exc}", "exec_result": None, "history_id": None}
 
-    key = make_key(rec["hash"], pipeline_engine.canonical_key(nodes))
-    cached = cache.get(key)
-    if cached:
+    base_key = make_key(rec["hash"], pipeline_engine.canonical_key(nodes))
+
+    # 校验先行：非法链不查缓存也不执行
+    val_errors = pipeline_engine.validate(nodes)
+    if not nodes:
+        val_errors = val_errors + ["流水线为空"]
+    if val_errors:
+        error = "; ".join(val_errors)
         entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                                pipeline_name, cached, True, None, None, t0)
-        return {"result_id": cached, "cache_hit": True, "error": None,
-                "exec_result": None, "history_id": entry["id"]}
+                                pipeline_name, None, [], False, error, None, t0)
+        return {"result_id": None, "cache_hit": False, "outputs": [],
+                "error": error, "exec_result": None, "history_id": entry["id"]}
+
+    sink_keys = _outputs_cache_keys(nodes, base_key)
+    cached_ids = {nid: cache.get(key) for nid, key in sink_keys.items()}
+    all_cached = all(rid for rid in cached_ids.values())
+
+    if all_cached:
+        outputs = []
+        for nid in sink_keys:
+            e = cache.get_entry(cached_ids[nid]) or {}
+            node = next((n for n in nodes if n["id"] == nid), None)
+            spec = node and pipeline_engine.node_registry.get_node(node["type"])
+            outputs.append({
+                "node_id": nid,
+                "type": node["type"] if node else None,
+                "label": (spec and spec.get("label")) or (node and node["type"]) or nid,
+                "result_id": cached_ids[nid],
+                "meta": e.get("meta", {}),
+                "ok": True,
+                "error": None,
+                "cache_hit": True,
+            })
+        entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
+                                pipeline_name, outputs[0]["result_id"], outputs, True,
+                                None, None, t0)
+        return {"result_id": outputs[0]["result_id"], "cache_hit": True,
+                "outputs": outputs, "error": None, "exec_result": None,
+                "history_id": entry["id"]}
 
     exec_result = pipeline_engine.execute(work, nodes)
     if exec_result.get("error"):
         entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                                pipeline_name, None, False, exec_result["error"],
+                                pipeline_name, None, [], False, exec_result["error"],
                                 exec_result.get("node_results"), t0)
-        return {"result_id": None, "cache_hit": False, "error": exec_result["error"],
-                "exec_result": exec_result, "history_id": entry["id"]}
+        return {"result_id": None, "cache_hit": False, "outputs": [],
+                "error": exec_result["error"], "exec_result": exec_result,
+                "history_id": entry["id"]}
 
-    result_id = cache.put(key, exec_result["image"], exec_result["meta"])
+    # 每个末端独立落盘（已缓存的末端直接复用，不重复计算/写入，meta 也以缓存为准）
+    outputs = []
+    for o in exec_result["outputs"]:
+        key = sink_keys[o["node_id"]]
+        existing = cache.get(key)
+        if existing:
+            rid = existing
+            hit = True
+            meta = (cache.get_entry(rid) or {}).get("meta", o["meta"])
+        else:
+            rid = cache.put(key, o["image"], o["meta"])
+            hit = False
+            meta = o["meta"]
+        outputs.append({
+            "node_id": o["node_id"],
+            "type": o["type"],
+            "label": o["label"],
+            "result_id": rid,
+            "meta": meta,
+            "ok": o["ok"],
+            "error": o["error"],
+            "cache_hit": hit,
+        })
+
+    primary = outputs[0]["result_id"] if outputs else None
     entry = _record_history(history, image_store, image_id, nodes, pipeline_id,
-                            pipeline_name, result_id, False, None,
+                            pipeline_name, primary, outputs, False, None,
                             exec_result.get("node_results"), t0)
-    return {"result_id": result_id, "cache_hit": False, "error": None,
-            "exec_result": exec_result, "history_id": entry["id"]}
+    return {"result_id": primary, "cache_hit": False, "outputs": outputs,
+            "error": None, "exec_result": exec_result, "history_id": entry["id"]}
 
 
 def _record_history(history, image_store, image_id, nodes, pipeline_id, pipeline_name,
-                    result_id, cache_hit, error, node_results, t0):
+                    result_id, outputs, cache_hit, error, node_results, t0):
+    """写一条历史。outputs 为全部末端结果 [{node_id, type, label, result_id, ...}]。"""
     rec = image_store.get(image_id)
     return history.add({
         "image_id": image_id,
@@ -80,6 +148,7 @@ def _record_history(history, image_store, image_id, nodes, pipeline_id, pipeline
         "pipeline_snapshot": {"nodes": nodes},
         "node_count": len(nodes),
         "result_id": result_id,
+        "outputs": outputs,
         "cache_hit": cache_hit,
         "status": "error" if error else "ok",
         "error": error,
@@ -157,6 +226,7 @@ class BatchManager:
                 j["results"][image_id] = {
                     "result_id": res["result_id"], "cache_hit": res["cache_hit"],
                     "status": "error" if res["error"] else "ok", "error": res["error"],
+                    "outputs": res.get("outputs", []),
                 }
                 j["done"] = len(j["results"])
                 return j

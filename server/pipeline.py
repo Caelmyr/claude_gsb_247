@@ -2,13 +2,18 @@
 
 难点之一「流水线引擎设计」的核心实现：
 
-- 节点用 inputs 表达依赖边（单输入链式，支持扇出）。执行前做完整校验：
+- 节点用 inputs 表达依赖边（单输入链式，支持扇出/分叉）。执行前做完整校验：
   类型存在性、id 唯一、输入引用存在、输入数量在 min/max 内、无环。
 - Kahn 拓扑排序决定执行顺序；每个节点消费其唯一上游节点的输出「数据包」，
   数据包 = 图像 + meta（meta 携带关键点/检测框/分割区域等非图像数据，
   供检测->画框、分割->统计这类下游节点复用）。
 - 每节点执行包裹 try/except，错误记录到该节点，前端可定位失败点。
 - canonical_key() 生成与拓扑顺序无关的确定性哈希，供结果缓存使用。
+
+多末端（分叉）语义：一个节点可以扇出给多个下游，因此一条链可能同时存在
+多个「无下游消费者」的末端节点（sink）。**每个 sink 都是一个独立结果**，
+execute() 通过 outputs 逐个返回，绝不静默丢弃；image/meta/output_node_id
+仅作为主输出（拓扑序第一个 sink）的向后兼容字段。
 """
 import json
 
@@ -94,6 +99,20 @@ def topological_order(nodes):
     return ordered
 
 
+def sink_nodes(nodes):
+    """返回所有末端节点 id（无下游消费者的节点），按拓扑序排列。
+
+    分叉链上每个 sink 都代表一路独立结果，顺序与拓扑序一致，保证主输出选择
+    稳定（不依赖节点在列表中的偶然排列）。
+    """
+    ordered, _ = _topo(nodes)
+    consumers = set()
+    for n in nodes:
+        for inp in (n.get("inputs") or []):
+            consumers.add(inp)
+    return [nid for nid in ordered if nid not in consumers]
+
+
 def canonical_key(nodes):
     """生成与布局/命名无关的确定性流水线指纹（供缓存命中判定）。"""
     ordered, _ = _topo(nodes)
@@ -109,8 +128,10 @@ def execute(image, nodes, source_meta=None):
     """在给定图像上执行流水线。
 
     返回 dict：
-      image          - 最终结果图像（主输出）
-      meta           - 主输出的 meta
+      outputs        - 全部末端结果 [{node_id, type, label, image, meta, ok, error}]
+                       分叉链的每个 sink 各占一项，一个都不丢
+      image          - 主输出图像（第一个 sink；无节点时为源图），向后兼容字段
+      meta           - 主输出的 meta，向后兼容字段
       node_results   - [{node_id, type, ok, error}] 逐节点状态
       output_node_id - 主输出节点（无节点时为 None）
       error          - 顶层错误（校验失败等）
@@ -118,7 +139,7 @@ def execute(image, nodes, source_meta=None):
     errors = validate(nodes)
     if errors:
         return {"image": image, "meta": source_meta or {}, "node_results": [],
-                "output_node_id": None, "error": "; ".join(errors)}
+                "outputs": [], "output_node_id": None, "error": "; ".join(errors)}
 
     ordered, _ = _topo(nodes)
     by_id = {n["id"]: n for n in nodes}
@@ -140,18 +161,31 @@ def execute(image, nodes, source_meta=None):
             node_results.append({"node_id": nid, "type": node["type"], "ok": False,
                                  "error": f"{type(exc).__name__}: {exc}"})
 
-    # 主输出 = 无下游消费者的节点中拓扑序最后一个；无节点则输出源图
-    consumers = set()
-    for n in nodes:
-        for inp in (n.get("inputs") or []):
-            consumers.add(inp)
-    sinks = [nid for nid in ordered if nid not in consumers]
-    output_node_id = sinks[-1] if sinks else (ordered[-1] if ordered else None)
+    # 所有无下游消费者的节点都是「结果」：分叉几路就收几路，不能只留一路
+    sinks = sink_nodes(nodes)
+    status_by_id = {r["node_id"]: r for r in node_results}
+    outputs = []
+    for nid in sinks:
+        pkt = packets[nid]
+        status = status_by_id.get(nid, {"ok": True, "error": None})
+        node = by_id[nid]
+        spec = node_registry.get_node(node["type"]) or {}
+        outputs.append({
+            "node_id": nid,
+            "type": node["type"],
+            "label": spec.get("label", node["type"]),
+            "image": pkt.image,
+            "meta": pkt.meta,
+            "ok": status["ok"],
+            "error": status["error"],
+        })
 
+    # 主输出 = 拓扑序第一个 sink（单链时唯一；无节点时输出源图）
+    output_node_id = sinks[0] if sinks else None
     if output_node_id:
         out = packets[output_node_id]
     else:
         out = packets["__source__"]
 
     return {"image": out.image, "meta": out.meta, "node_results": node_results,
-            "output_node_id": output_node_id, "error": None}
+            "outputs": outputs, "output_node_id": output_node_id, "error": None}

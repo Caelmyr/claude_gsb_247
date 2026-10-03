@@ -45,11 +45,13 @@ window.Views.pipeline = (function () {
   function renderNodes() {
     canvas.querySelectorAll(".node").forEach((n) => n.remove());
     nodeEls = {};
+    const sinks = sinkIds(nodes);
     nodes.forEach((n) => {
+      const isSink = sinks.has(n.id);
       const el = C.h(`
-        <div class="node ${sel === n.id ? "selected" : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
+        <div class="node ${sel === n.id ? "selected" : ""} ${isSink ? "sink" : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
           <div class="node-header"><span class="dot"></span>${C.esc(nodeLabel(n.type))}
-            <span style="flex:1"></span><span class="node-x" title="删除">×</span></div>
+            <span style="flex:1"></span>${isSink ? '<span class="sink-tag" title="末端节点：它的输出会作为一路结果展示/保存">结果</span>' : ""}<span class="node-x" title="删除">×</span></div>
           <div class="node-body">${C.esc((C._nodesInfo[n.type] && C._nodesInfo[n.type].desc) || "")}</div>
           <div class="port in" data-id="${n.id}" data-port="in"></div>
           <div class="port out" data-id="${n.id}" data-port="out"></div>
@@ -59,6 +61,13 @@ window.Views.pipeline = (function () {
       bindNode(el, n);
     });
     redrawEdges();
+  }
+
+  // 末端 = 没有任何节点把它当输入的节点；每个末端都会成为一路独立结果
+  function sinkIds(ns) {
+    const consumed = new Set();
+    ns.forEach((n) => (n.inputs || []).forEach((s) => consumed.add(s)));
+    return new Set(ns.filter((n) => !consumed.has(n.id)).map((n) => n.id));
   }
 
   function redrawEdges() {
@@ -221,12 +230,16 @@ window.Views.pipeline = (function () {
     if (!imageId) { C.toast("请先选择输入图像", "error"); return; }
     if (!nodes.length) { C.toast("流水线为空，请先添加节点", "error"); return; }
     const preview = inspectorEl.querySelector("#insp-preview");
+    preview.classList.remove("multi");
     preview.innerHTML = `<div class="loading">运行中…</div>`;
     try {
       const r = await Api.post("/api/run", { image_id: imageId, nodes: nodes.map(strip), pipeline_name: "临时流水线" });
-      preview.innerHTML = `
-        <img src="${r.file_url}?t=${Date.now()}">
-        <div class="caption">${r.cache_hit ? "缓存命中" : "已计算"} · ${(r.meta && r.meta.count != null) ? "对象 " + r.meta.count : ""}</div>`;
+      if (r.error) {
+        preview.classList.remove("multi");
+        preview.innerHTML = `<div class="empty">运行失败：${C.esc(r.error)}</div>`;
+        return;
+      }
+      renderOutputs(preview, r);
       // 标记失败节点
       const failed = (r.node_results || []).filter((n) => !n.ok);
       if (failed.length) {
@@ -237,6 +250,35 @@ window.Views.pipeline = (function () {
     } catch (e) {
       preview.innerHTML = `<div class="empty">运行失败：${C.esc(e.message)}</div>`;
     }
+  }
+
+  // 逐末端展示：每个 sink 一张卡片，标题写清「是哪个节点的结果」，绝不让用户猜
+  function renderOutputs(preview, r) {
+    const outputs = (r.outputs && r.outputs.length) ? r.outputs : [{
+      node_id: r.output_node_id, label: "结果", result_id: r.result_id,
+      file_url: r.file_url, meta: r.meta, cache_hit: r.cache_hit, ok: true,
+    }];
+    preview.classList.toggle("multi", outputs.length > 1);
+    const sinks = sinkIds(nodes);
+    const forkHint = outputs.length > 1
+      ? `<div class="multi-output-banner">检测到 ${outputs.length} 个末端结果，已全部展示（每个「结果」标记的节点各一路）：</div>` : "";
+    preview.innerHTML = forkHint + `<div class="${outputs.length > 1 ? "stage-grid" : ""}">` +
+      outputs.map((o, i) => {
+        const metaCount = (o.meta && o.meta.count != null) ? ` · 对象 ${o.meta.count}` : "";
+        const hit = o.cache_hit ? "缓存命中" : "已计算";
+        const primary = i === 0 ? '<span class="badge green" title="历史与批处理中的主结果">主结果</span>' : "";
+        const warn = o.ok === false ? `<span class="badge red" title="${C.esc(o.error || "节点执行失败")}">该节点执行失败，图为透传上游结果</span>` : "";
+        return `<div class="output-card">
+          <div class="output-title">${primary} <span class="badge">${C.esc(o.label || o.node_id || "结果")} #${C.esc(o.node_id || "-")}</span> ${warn}</div>
+          ${o.file_url ? `<img src="${o.file_url}?t=${Date.now()}">` : '<div class="empty">无结果图</div>'}
+          <div class="caption">${hit}${metaCount}</div>
+        </div>`;
+      }).join("") + `</div>`;
+    // 画布上的末端高亮与结果数提示保持同步
+    nodes.forEach((n) => {
+      const el = nodeEls[n.id];
+      if (el) el.classList.toggle("has-result", sinks.has(n.id));
+    });
   }
 
   function strip(n) { return { id: n.id, type: n.type, params: n.params, inputs: n.inputs, x: n.x, y: n.y }; }
